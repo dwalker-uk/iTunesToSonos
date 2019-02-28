@@ -3,7 +3,7 @@ import os
 import shutil
 import json
 import urllib.parse
-from lxml import etree
+import unicodedata
 
 
 def main():
@@ -11,6 +11,7 @@ def main():
     # TODO: Wait max e.g. 10secs for response to keeping selection, otherwise continue anyway.
     # TODO: Check if Playlist ID has changed, even if name stays the same
     # TODO: Check that tracks in export folder are needed, optionally clean up those not associated with a playlist
+    # TODO: Need to test whether playlist has been deleted - assumes it does so gives out of range error
 
     settings_file = 'settings.json'
     settings = {}
@@ -59,10 +60,10 @@ def main():
         settings['playlists'] = []
     else:
         print('On your previous run, the following Playlists were exported: ')
-        for name in [x['Name'] for x in settings['playlists'] if x['Export'] is True]:
+        for name in [pl['Name'] for pl in settings['playlists'] if pl['Export'] is True]:
             print('  - ', name)
         print('And the following Playlists were not: ')
-        for name in [x['Name'] for x in settings['playlists'] if x['Export'] is False]:
+        for name in [pl['Name'] for pl in settings['playlists'] if pl['Export'] is False]:
             print('  - ', name)
         while True:
             keep_selection = input('Do you want to keep this selection? (y/n)  ' +
@@ -79,7 +80,7 @@ def main():
     for itunes_playlist in itunes_library['Playlists']:
 
         # Deal with new (or renamed) playlists
-        if itunes_playlist['Name'] not in [x['Name'] for x in settings['playlists']]:
+        if itunes_playlist['Name'] not in [pl['Name'] for pl in settings['playlists']]:
             while True:
                 should_include = input('New playlist "%s" - do you want to export? (y/n) ' % itunes_playlist['Name'])
                 if should_include in ('y', 'Y'):
@@ -99,95 +100,79 @@ def main():
         json.dump(settings, settings_handle, indent=2, sort_keys=True)
 
     # Do the export for each selected playlist
-    for playlist_name in [x['Name'] for x in settings['playlists'] if x['Export'] is True]:
+    for playlist_name in [pl['Name'] for pl in settings['playlists'] if pl['Export'] is True]:
         print('Exporting "%s" Playlist...' % playlist_name)
-
-        # ElementTree approach...
-        wpl_playlist = etree.Element('smil')
-        wpl_header = etree.Element('head')
-        wpl_body = etree.Element('body')
-        wpl_seq = etree.SubElement(wpl_body, 'seq')
-        wpl_count = 0
 
         # String approach (wpl)...
         playlist_wpl_media = ''
         playlist_wpl_count = 0
         playlist_wpl_duration = 0
 
-        # String approach (m3u)...
-        playlist_m3u = '#EXTM3U\n'
-
         itunes_playlist_info = [x for x in itunes_library['Playlists'] if x['Name'] == playlist_name][0]
         for track in itunes_playlist_info['Playlist Items']:
-            # Add entry into the playlist
+
+            # Translate filename into correct formats - important process:
+            #  1. Calculate the length of iTunes path to strip, in order to make the path relative
+            #  2. Get the relative path to the file, by stripping the iTunes path and adding Media/ instead
+            #  3. Remove iTunes library's url encoding, e.g. %20 is used instead of space
+            #  4. Normalise the unicode string, using NFC form (i.e a single composed character for an accented letter)
+            #  5. Replace &, <, >, " characters - note don't need to replace ' as will use double quotes in XML
             left = len(itunes_library['Music Folder']) + 6      # +6 takes off iTunes' /Music folder too!
+            t_path_relative = 'Media/' + itunes_library['Tracks'][str(track['Track ID'])]['Location'][left:]
+            t_path_unquoted = urllib.parse.unquote(t_path_relative)
+            t_path_norm = unicodedata.normalize('NFC', t_path_unquoted)
+            t_path = t_path_norm.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 
-            # String approach (m3u)...
-            playlist_m3u += '#EXTINF:%d,%s - %s\n' % (
-                itunes_library['Tracks'][str(track['Track ID'])]['Total Time'] / 1000,
-                urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Artist']),
-                urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Name']))
-            playlist_m3u += 'Media/%s\n' % (
-                urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Location'][left:]))
-
-            # String approach (wpl)...
+            # Add this track's details to the wpl file
             playlist_wpl_count += 1
             playlist_wpl_duration += int(itunes_library['Tracks'][str(track['Track ID'])]['Total Time'] / 1000)
-            playlist_wpl_media += '            <media src="Media/%s"/>\n' % (
-                urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]
-                                     ['Location'][left:])).replace('&', '&amp;')
+            playlist_wpl_media += '            <media src="%s"/>\n' % t_path
 
-            # ElementTree approach...
-            wpl_count += 1
-            etree.SubElement(wpl_seq, 'media', src='Media/%s' % (
-                urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Location'][left:])))
-
-            # Copy the file to the export location, if it's not already there
-            # Note all actual file operations need to be unquoted, to remove e.g. %20 instead of space
-            # Note for src_path the [7:] slice removes file:// from the front of the path
+            # Get the paths for source and destination for the actual file copy
+            # Note all actual file operations need to be unquoted, to remove e.g. %20 instead of space - but don't
+            # need to normalise or replace XML characters
+            # Note for src_path the [7:] slice removes file:// from the front of the path - not needed on Mac
             src_path = urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Location'][7:])
-            dest_path = os.path.join(settings['export_path'],
-                                     'Media',
-                                     urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]
-                                                          ['Location'][left:]))
+            dest_path = urllib.parse.unquote(
+                                    os.path.join(settings['export_path'],
+                                                 'Media',
+                                                 itunes_library['Tracks'][str(track['Track ID'])]['Location'][left:]))
+
+            # Check if file already exists, and if not then copy over (making folder if needed, and reporting progress)
             if not os.path.isfile(dest_path):
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                 print('  Copying %s - %s...' % (
-                    urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Artist']),
-                    urllib.parse.unquote(itunes_library['Tracks'][str(track['Track ID'])]['Name'])))
+                    itunes_library['Tracks'][str(track['Track ID'])]['Artist'],
+                    itunes_library['Tracks'][str(track['Track ID'])]['Name']))
                 shutil.copyfile(src_path, dest_path)
 
-        # Once added all tracks to the playlist, save the m3u file out to disk
-        # Have been tweaking extension here, depending on which approach I'm trying...
-        dest_path = os.path.join(settings['export_path'],
-                                 urllib.parse.unquote(itunes_playlist_info['Name']) + 'X5.wpl')
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        # Once added all tracks to the playlist, get path and make folder for saving wpl file to disk
+        pl_dest_path = os.path.join(settings['export_path'],
+                                    urllib.parse.unquote(itunes_playlist_info['Name']) + '.wpl')
+        os.makedirs(os.path.dirname(pl_dest_path), exist_ok=True)
 
-        # ElementTree approach...
-        wpl_title = etree.SubElement(wpl_header, 'title')
-        wpl_title.text = itunes_playlist_info['Name']
-        etree.SubElement(wpl_header, 'meta', name='ItemCount', content=str(playlist_wpl_count))
+        # Create and write the wpl file
+        with open(pl_dest_path, 'wb') as playlist_file:
 
-        with open(dest_path, 'w') as playlist_file:
+            # Generate start and end of the playlist
+            prefix = ('<?wpl version="1.0"?>\n' +
+                      '<smil>\n' +
+                      '    <head>\n' +
+                      '        <title>' + itunes_playlist_info['Name'] + '</title>\n' +
+                      '        <meta name="Generator" content="https://github.com/dwalker-uk/iTunesToSonos"/>\n' +
+                      '        <meta name="ItemCount" content="' + str(playlist_wpl_count) + '"/>\n' +
+                      '        <meta name="TotalDuration" content="' + str(playlist_wpl_duration) + '"/>\n' +
+                      '    </head>\n' +
+                      '    <body>\n' +
+                      '        <seq>\n')
+            suffix = ('        </seq>\n +'
+                      '    </body>\n' +
+                      '</smil>')
 
-            # ElementTree approach...
-            # wpl_playlist.append(wpl_header)
-            # wpl_playlist.append(wpl_body)
-            # playlist_file.write(etree.tostring(wpl_playlist, pretty_print=True).decode('utf-8'))
-
-            # String approach (wpl)...
-            playlist_file.write('<?wpl version="1.0"?>\n' +
-                                '<smil>\n' +
-                                '    <head>\n' +
-                                '        <title>' + itunes_playlist_info['Name'] + '</title>\n' +
-                                '        <meta name="ItemCount" content="' + str(playlist_wpl_count) + '"/>\n' +
-                                '    </head>\n' +
-                                '    <body>\n' +
-                                '        <seq>\n')
-            playlist_file.write(playlist_wpl_media)
-            playlist_file.write('        </seq>\n +'
-                                '    </body>\n' +
-                                '</smil>')
+            # Write the playlist to file, using ascii with xml character replacement encoding
+            playlist_file.write(prefix.encode('ascii', 'xmlcharrefreplace'))
+            playlist_file.write(playlist_wpl_media.encode('ascii', 'xmlcharrefreplace'))
+            playlist_file.write(suffix.encode('ascii', 'xmlcharrefreplace'))
 
         print('"%s" Playlist Export Complete!' % playlist_name)
 
