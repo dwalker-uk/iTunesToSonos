@@ -82,9 +82,9 @@ def main():
 
         for track in playlist_tracks:
             # Get just the artist/album/track part of the track's path
-            artist_album_track = track[track.rfind('/', 0, track.rfind('/', 0, track.rfind('/'))):]
+            artist_album_track = track[track.rfind('/', 0, track.rfind('/', 0, track.rfind('/')))+1:]
             # Create the full path to export this track to
-            export_path = os.path.join(settings['export_path'], f'Media/{artist_album_track}')
+            export_path = os.path.join(settings['export_path'], 'Media', artist_album_track)
             # Create the path formatted appropriately for the playlist: NFC Normalized, and replaced special characters
             playlist_path = unicodedata.normalize('NFC', f'Media/{artist_album_track}').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 
